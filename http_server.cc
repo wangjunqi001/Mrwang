@@ -13,64 +13,128 @@
 #include "util.hpp"
 #include <sys/wait.h>
 #include <sys/stat.h>
-#include "ThreadPool.hpp"
+#include "timer.h"
+#include "epoll.h"
 
 using sockaddr_in = struct sockaddr_in;
 using SA = struct sockaddr;
 
+pthread_mutex_t server_construct = PTHREAD_MUTEX_INITIALIZER;
+
 namespace httpserver{
+
+	HttpServer* HttpServer::Instance = NULL;
 
 	void* thread_entry(void* arg){
 		Context* context = reinterpret_cast<Context*>(arg);
-		int ret = context->server->ReadOneRequest(context);
-		if( ret < 0 ){
-			LOG(ERROR)<<"ReadOneRequest"<<endl;
-			context->server->NotFound(&context->response);
-			goto END;
-		}
-		ret = context->server->HandlerRequest(context);
-		if(ret <0){
-			LOG(ERROR)<<"HandlerRequest"<<endl;
-			context->server->NotFound(&context->response);
-			goto END;
-		}
-END:context->server->WriteOneResponse(context);
+		HttpServer* server = HttpServer::GetInstance();
+		int	ret = server->ReadOneRequest(context);
+			if( ret < 0 ){
+				LOG(ERROR)<<"ReadOneRequest"<<endl;
+				server->NotFound(&context->response);
+				server->WriteOneResponse(context);
+				goto END;
+			}
+			if(ret < 0 ){
+				LOG(ERROR)<<"HandlerRequest"<<endl;
+				server->NotFound(&context->response);
+				server->WriteOneResponse(context);
+				goto END;
+			}
+END:server->WriteOneResponse(context);
+		Epoll* http_ep = server->GetEpoll();
+		http_ep->Delfd(context->new_fd,EPOLLIN|EPOLLET,context);
 		close(context->new_fd);
 		delete context;
 		return NULL;
 	}
 
-	int HttpServer::Startup(const unsigned short port){
+	HttpServer* HttpServer::GetInstance(){
+		if(Instance == NULL){
+			pthread_mutex_lock(&server_construct);
+			if(Instance == NULL)
+				Instance = new HttpServer;
+			pthread_mutex_unlock(&server_construct);
+		}
+		return HttpServer::Instance;
+	}
+
+	void HttpServer::DestoryInstance(){
+		delete Instance;
+		Instance = NULL;
+	}
+
+	HttpServer::HttpServer(){
 		int listen_sock = socket(PF_INET,SOCK_STREAM,0);
 		if(listen_sock < 0)
 			error_die("socket");
+		int optval = 1;
+		if(setsockopt(listen_sock , SOL_SOCKET , SO_REUSEADDR , (const void*)&optval , sizeof(int)) == -1)
+			error_die("setsockopt");
 		sockaddr_in sock;
 		socklen_t len = sizeof(sock);
-		
 		sock.sin_family = AF_INET;
 		sock.sin_addr.s_addr = htonl(INADDR_ANY);
-		sock.sin_port = htons(port);
-		if( bind(listen_sock,(SA*)&sock,len) < 0 ) 
+		sock.sin_port = htons(HTTP_SERVER_DEFAULT_TCP_PORT);
+		if( bind(listen_sock,(SA*)&sock,len) < 0 ){
+			close(listen_sock);
 			error_die("bind");
-		if( listen(listen_sock , 5) < 0 )
-			error_die("listen");
-#ifdef debug
-		LOG(DEBUG)<<"Server start ok!"<<endl;
-#endif
-		thread_pool pool(3,100,100);
-		while(1){
-			sockaddr_in peer;
-			socklen_t peer_len = sizeof(peer);
-			int new_fd = accept(listen_sock,(SA*)&peer,&peer_len);
-			Context* context = new Context();
-			context->new_fd = new_fd;
-			//pthread_t tid;
-			//pthread_create(&tid,0,thread_entry,(void*)context);
-			//pthread_detach(tid);
-			pool.Add(thread_entry,context);
 		}
-		close(listen_sock);
-		return 0;
+		if( listen(listen_sock , 5) < 0 ){
+			close(listen_sock);
+			error_die("listen");
+		}
+		http_tp = new thread_pool(HTTP_SERVER_DEFAULT_MIN_THR,HTTP_SERVER_DEFAULT_MAX_THR,HTTP_SERVER_DEFAULT_JOB_BUFFER_SIZE);
+		if(FileUtil::SetfdNonblock(listen_sock) == -1){
+			close(listen_sock);
+			error_die("Set sock nonblock failed");
+		}
+		http_ep = new Epoll(0 , listen_sock , http_tp);
+#ifdef debug
+		LOG(DEBUG)<<"Server start ok! Listen Socket = "<< listen_sock << endl;
+#endif
+	}
+
+	void HttpServer::AcceptRequest(){
+		sockaddr_in client_addr;
+		socklen_t len = sizeof(client_addr);
+		int new_fd = accept(http_ep->GetListenSock() , (sockaddr*)&client_addr , &len);
+		if(new_fd == -1){
+			LOG(ERROR) << "accept failed" << endl;
+			return;
+		}
+		Context* context = new Context();
+		if(FileUtil::SetfdNonblock(new_fd) < 0)
+			LOG(ERROR) << "SetfdNonblockd failed" << endl;
+#ifdef debug
+		LOG(DEBUG) << "new_fd = "<< new_fd << endl;
+#endif 
+		http_ep->Addfd(new_fd , EPOLLET|EPOLLIN , context);
+#ifdef debug
+		LOG(DEBUG) << "add accept socket = " << new_fd << endl;
+#endif 
+	}
+
+	void HttpServer::ServerLoop(){
+		while(1){
+			int events_num = http_ep->Wait();
+			if(events_num <= 0)
+				continue;
+#ifdef debug
+	LOG(DEBUG) << "ready event num = " << events_num << endl;
+#endif 
+			http_ep->HandlerEvents(events_num);
+		}
+		close(http_ep->GetListenSock());
+	}
+
+	HttpServer::~HttpServer(){
+		delete http_tp;
+		delete http_ep;
+	}
+
+	Epoll* HttpServer::GetEpoll(){
+		return http_ep; 
 	}
 
 	int HttpServer::ReadOneRequest(Context* context){
@@ -85,6 +149,7 @@ END:context->server->WriteOneResponse(context);
 			LOG(ERROR)<<"ParseFirstline error";
 			return -1;
 		}
+		UrlDecode(requ->url);
    	ret = ParseUrl(requ->url,&requ->url_path,&requ->query_string);
 #ifdef debug
 		LOG(DEBUG)<<"[url_path & query_string]-- "<<requ->url_path.c_str()<<" "<<requ->query_string.c_str()<<endl;
@@ -139,6 +204,25 @@ END:context->server->WriteOneResponse(context);
 		*query_string = url.substr(pos+1);
 		return 0;
 	}
+
+	void HttpServer::UrlDecode(const string& Url){ // 对URL解码 如C%2B%2B -> c++ 这只能简单解决中文URL的问题，不能支持所有Unicode
+		string DstUrl;
+		DstUrl.reserve(Url.size());
+		size_t n = Url.size();
+		for(size_t i = 0 ; i < n ; ++i){
+			if(Url[i] == '%'){
+				if(i + 1 < n && isxdigit(Url[i + 1]) && i + 2 < n && isxdigit(Url[i + 2])){
+					int a = xtoi(Url[i + 1]);
+					int b = xtoi(Url[i + 2]);
+					DstUrl.push_back( (a << 4) | b );
+				}else
+				DstUrl.push_back('%');
+			}
+			else
+				DstUrl.push_back(Url[i]);
+		}
+	}
+
 	//HOST: 0.0.0.0
 	int HttpServer::ParseHeader(const string& line,Header* header){
 		size_t pos = line.find(":");
@@ -281,14 +365,11 @@ END:context->server->WriteOneResponse(context);
 	}
 }//end of httpserver
 
-int main(int argc,char* argv[]){
-	if(argc != 2){
-		cout<<"Usage ./http_server [port]\n";
-		return 1;
-	}
-	httpserver::HttpServer server;
-	if(server.Startup(atoi(argv[1])) != 0 )
-		error_die("HttpServer Startup");
+int main(){
+	httpserver::HttpServer* server = httpserver::HttpServer::GetInstance();
+	server->ServerLoop();
+	pthread_mutex_destroy(&server_construct);
+	httpserver::HttpServer::DestoryInstance();
 	return 0;
 }
 
